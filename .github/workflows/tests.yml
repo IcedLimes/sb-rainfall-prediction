@@ -9,7 +9,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      # igraph (needed by the kknn engine) links against GLPK at runtime
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libglpk40
 
       - uses: r-lib/actions/setup-pandoc@v2
 
