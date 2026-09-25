@@ -1,0 +1,26 @@
+Package: sbrainfall
+Title: Predicting Next-Day Rainfall in Santa Barbara, California
+Version: 1.0.0
+Description: Analysis project (not an installable package). This file lists
+    the R packages the report and tests need; renv.lock pins exact versions.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1)
+Imports:
+    corrplot,
+    discrim,
+    dplyr,
+    ggplot2,
+    here,
+    kknn,
+    knitr,
+    MASS,
+    naniar,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    themis,
+    tibble,
+    tidymodels,
+    withr
+Config/testthat/edition: 3

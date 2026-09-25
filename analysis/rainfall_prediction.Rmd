@@ -1,0 +1,418 @@
+---
+title: "Predicting Next-Day Rainfall in Santa Barbara, California"
+subtitle: "A first machine learning project: comparing classifiers on nearly 19 years of NOAA weather data"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+    mathjax: null
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5, dpi = 120)
+```
+
+# Introduction
+
+Precipitation is one of the hardest parts of a weather forecast to get right (Imon et al., 2012), and forecasting it from historical records alone involves many modelling decisions (Wu & Chau, 2013).
+
+Santa Barbara has a Mediterranean climate: mild, dry summers and cool, rainy winters (Bailey, 2023). January lows are around 8 °C (47 °F), July highs reach about 27 °C (81 °F), and the city averages roughly 14.7 inches of rain a year, almost all of it in winter ([City of Santa Barbara, 2024](https://santabarbaraca.gov/sites/default/files/2024-09/AWE_Santa%20Barbara%20Water%20Affordability%20Study_April%202024_FINAL.pdf)).
+
+**Goal:** given today's weather at Santa Barbara Municipal Airport, predict whether it will rain **tomorrow**.
+
+The data are daily summaries from NOAA's National Centers for Environmental Information ([NCEI](https://www.ncei.noaa.gov/access/search/dataset-search)) for station USW00023190, January 2006 to September 2024: precipitation, maximum and minimum temperature, average wind speed, and maximum and minimum relative humidity. Column definitions and units are in `data/README.md` in the repository.
+
+The pipeline cleans the data, explores it, then compares four classifiers covered in an introductory statistical learning course: logistic regression, linear discriminant analysis (LDA), quadratic discriminant analysis (QDA) and a tuned k-nearest neighbours (KNN) model.
+
+```{r packages}
+library(tidymodels)
+library(discrim)
+library(themis)
+library(naniar)
+library(corrplot)
+
+source(here::here("R", "prepare_data.R"))
+tidymodels_prefer()
+theme_set(theme_minimal())
+```
+
+# Data
+
+`read_station_data()` loads the raw file, lower-cases the column names and converts NOAA's integer units (tenths of a millimetre, degree or metre per second) into real units. Station name, coordinates and elevation are constant for every row, and average humidity is derived from the minimum and maximum, so those columns are left out.
+
+```{r load}
+daily <- read_station_data(here::here("data", "santa_barbara_airport_daily.csv"))
+summary(daily)
+```
+
+## Missing and invalid values
+
+```{r missing}
+vis_miss(daily)
+incomplete <- sum(!complete.cases(daily))
+```
+
+Only `r incomplete` of `r nrow(daily)` days (`r percent(incomplete / nrow(daily), accuracy = 0.01)`) have a missing value, which is too few to be worth imputing, so those days are dropped. Three more days record 100% *minimum* and 0% *maximum* humidity, which is physically impossible, so `clean_station_data()` drops them as well. One calendar day (2022-05-31) is absent from the file entirely.
+
+```{r clean}
+clean <- clean_station_data(daily) |>
+  mutate(rain = factor(if_else(prcp_mm > 0, "yes", "no"), levels = c("yes", "no")))
+nrow(clean)
+```
+
+# Exploratory data analysis
+
+We only care whether it rains, not how much, so any day with measurable precipitation counts as a rain day.
+
+## How often does it rain?
+
+```{r eda-balance}
+ggplot(clean, aes(x = rain)) +
+  geom_bar(aes(y = after_stat(count / sum(count))), fill = "steelblue") +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Rain day", y = "Share of days", title = "Proportion of rain days, 2006–2024")
+```
+
+Only `r percent(mean(clean$rain == "yes"), accuracy = 0.1)` of days have rain. That imbalance is normal for a Mediterranean climate, but it matters for modelling: a model that always says "no rain" would be about 90% accurate and completely useless. That is why the models below are judged on ROC AUC and precision–recall AUC rather than accuracy.
+
+## Rain by month
+
+```{r eda-month}
+monthly_plot <- clean |>
+  mutate(month = factor(month.abb[as.integer(format(date, "%m"))], levels = month.abb)) |>
+  ggplot(aes(x = month, fill = rain)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c(yes = "steelblue", no = "grey80")) +
+  labs(x = NULL, y = "Share of days", fill = "Rain day", title = "Rain days by month")
+monthly_plot
+ggsave(here::here("figures", "rain_by_month.png"), monthly_plot, width = 7, height = 4, dpi = 150, bg = "white")
+```
+
+Rain is concentrated in the winter months, with almost none from June to September. Because season is such a strong signal, the models get the day of the year as a predictor, encoded as a sine/cosine pair so that 31 December and 1 January end up next to each other.
+
+## Rain by maximum temperature
+
+```{r eda-tmax}
+clean |>
+  mutate(tmax_bin = cut(tmax_c, breaks = seq(10, 40, by = 2), include.lowest = TRUE)) |>
+  ggplot(aes(x = tmax_bin, fill = rain)) +
+  geom_bar() +
+  scale_fill_manual(values = c(yes = "steelblue", no = "grey80")) +
+  labs(x = "Daily maximum temperature (°C)", y = "Number of days", fill = "Rain day",
+       title = "Rain days by maximum temperature") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Rain days are overwhelmingly cool days. It rains on most days with a high below 14 °C, on about one day in five with a high of 16–18 °C, and on fewer than 2% of days above 22 °C.
+
+## Correlation between predictors
+
+```{r eda-corr, fig.height = 5}
+clean |>
+  select(tmax_c, tmin_c, awnd_ms, rhmn, rhmx) |>
+  cor() |>
+  corrplot(method = "color", addCoef.col = "black", tl.col = "black", tl.srt = 0)
+```
+
+The strongest correlation is between minimum and maximum humidity (0.63), which follow the same daily cycle. The temperature and humidity pairs sit around ±0.45. None of these is high enough to destabilise the linear models.
+
+# Framing the prediction
+
+A tempting shortcut is to classify whether it rains **on the same day** as the weather measurements. That task is easier than a real forecast, because humidity measured *during* a rainy day is partly a consequence of the rain. It describes today rather than predicting anything.
+
+This project instead predicts **tomorrow's** rain from today's observations, which is a real forecast. `build_model_data()` builds one row per day with:
+
+- today's maximum and minimum temperature (`tmax_c`, `tmin_c`), average wind speed (`awnd_ms`), and minimum and maximum humidity (`rhmn`, `rhmx`);
+- whether it rained today (`rain_today`), and how much (`prcp_log`, log-transformed);
+- the day of the year as a sine/cosine pair (`doy_sin`, `doy_cos`);
+- the outcome: whether it rains the next calendar day.
+
+Outcomes are matched by date rather than by row position, so the missing day in 2022 cannot pair a day with the wrong "tomorrow".
+
+```{r model-data}
+model_data <- build_model_data(daily, horizon = 1)
+glimpse(model_data)
+```
+
+# Model setup
+
+## Splitting by time
+
+Weather on consecutive days is strongly related, so a random split would put near-copies of test days into the training set and make the models look better than they are. Instead, the data are split **by water year** (October–September, one rainy season each):
+
+- **Training:** water years 2006–2020 (January 2006 to September 2020)
+- **Test:** the four most recent rainy seasons, water years 2021–2024 (October 2020 to September 2024)
+
+For cross-validation within the training set, entire water years are held out together (5 folds of about 3 seasons each). In the table below, dates are the days forecasts are made *from*; each one predicts the following day.
+
+```{r split}
+split <- split_by_water_year(model_data, test_years = 4)
+train <- split$train
+test <- split$test
+
+set.seed(123)
+folds <- group_vfold_cv(train, group = water_year, v = 5)
+
+tibble(set = c("train", "test"),
+       days = c(nrow(train), nrow(test)),
+       from = c(min(train$date), min(test$date)),
+       to = c(max(train$date), max(test$date)),
+       rain_share = c(mean(train$rain == "yes"), mean(test$rain == "yes")))
+```
+
+## Recipe
+
+All four models share one preprocessing recipe:
+
+- **Interaction terms** between maximum temperature and wind, minimum humidity and minimum temperature. The idea is that the effect of a warm day depends on the other conditions: a warm, humid, windy day is different from a warm, dry, calm one.
+- **Normalisation**, so that predictors measured on large scales do not dominate the distance-based KNN model.
+- **Up-sampling** of rain days in the training data, so that each model sees as many rain days as dry days. This is applied only when training (`skip = TRUE`), never to the data being evaluated.
+
+```{r recipe}
+make_rain_recipe <- function(training_data) {
+  recipe(rain ~ ., data = training_data) |>
+    update_role(date, water_year, new_role = "id") |>
+    step_interact(terms = ~ tmax_c:awnd_ms + tmax_c:rhmn + tmax_c:tmin_c) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_upsample(rain, over_ratio = 1, skip = TRUE)
+}
+rain_recipe <- make_rain_recipe(train)
+```
+
+## Models
+
+```{r models}
+model_specs <- list(
+  "Logistic regression" = logistic_reg() |> set_engine("glm"),
+  "LDA" = discrim_linear() |> set_engine("MASS"),
+  "QDA" = discrim_quad() |> set_engine("MASS"),
+  "KNN" = nearest_neighbor(neighbors = tune()) |> set_engine("kknn")
+)
+workflows <- map(model_specs, \(spec) workflow(rain_recipe, spec |> set_mode("classification")))
+```
+
+KNN is tuned over a wide range of neighbours, from 5 to 1,000. Small values work poorly here: up-sampling repeats each rain day several times, so a handful of "neighbours" are often copies of the same day.
+
+# Model comparison
+
+```{r fit-cv}
+cv_metrics <- metric_set(roc_auc, pr_auc)
+
+cv_results <- list(
+  "Logistic regression" = fit_resamples(workflows[["Logistic regression"]], folds, metrics = cv_metrics),
+  "LDA" = fit_resamples(workflows[["LDA"]], folds, metrics = cv_metrics),
+  "QDA" = fit_resamples(workflows[["QDA"]], folds, metrics = cv_metrics)
+)
+
+knn_tuning <- tune_grid(workflows[["KNN"]], folds,
+                        grid = tibble(neighbors = c(5, 10, 25, 50, 100, 200, 300, 500, 750, 1000)),
+                        metrics = cv_metrics)
+best_knn <- select_by_one_std_err(knn_tuning, desc(neighbors), metric = "roc_auc")
+knn_auc <- collect_metrics(knn_tuning) |> filter(.metric == "roc_auc")
+
+autoplot(knn_tuning, metric = "roc_auc") + labs(title = "KNN: cross-validated ROC AUC by number of neighbours")
+```
+
+KNN keeps improving as neighbours are added, from a cross-validated ROC AUC of `r round(knn_auc$mean[knn_auc$neighbors == 5], 3)` with 5 neighbours to `r round(max(knn_auc$mean), 3)` at best. `select_by_one_std_err()` picks the simplest model (the one with the most neighbours) within one standard error of the best, which gives **k = `r best_knn$neighbors`**. With that many neighbours, each prediction averages over more than a tenth of the training data, so KNN ends up behaving like a smooth, almost linear model. That is another hint that the linear models suit this problem.
+
+```{r compare}
+cv_summary <- imap(cv_results, \(res, name) collect_metrics(res) |> mutate(model = name)) |>
+  list_rbind() |>
+  bind_rows(
+    collect_metrics(knn_tuning) |>
+      filter(.config == best_knn$.config) |>
+      mutate(model = paste0("KNN (k = ", best_knn$neighbors, ")"))
+  ) |>
+  select(model, .metric, mean, std_err) |>
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) |>
+  select(model, mean_roc_auc, std_err_roc_auc, mean_pr_auc, std_err_pr_auc) |>
+  arrange(desc(mean_roc_auc))
+
+knitr::kable(cv_summary, digits = 3,
+             col.names = c("Model", "ROC AUC", "ROC AUC std. err.", "PR AUC", "PR AUC std. err."))
+
+best_model <- cv_summary$model[1]
+best_model_key <- if (startsWith(best_model, "KNN")) "KNN" else best_model
+```
+
+**`r best_model`** has the highest mean ROC AUC across the held-out seasons, but the models are within about one standard error of each other, so the choice between them matters little. For reference, random guessing scores a ROC AUC of 0.5, and its PR AUC equals the share of rain days (about `r round(mean(train$rain == "yes"), 2)`).
+
+# Final model on the test seasons
+
+Only now is the chosen model fitted to the full training set and evaluated on the four held-out rainy seasons, which it has never seen.
+
+```{r final-fit}
+final_workflow <- workflows[[best_model_key]]
+if (best_model_key == "KNN") final_workflow <- finalize_workflow(final_workflow, best_knn)
+
+final_fit <- fit(final_workflow, data = train)
+test_pred <- augment(final_fit, new_data = test)
+train_pred <- augment(final_fit, new_data = train)
+```
+
+## Is the model better than simple rules?
+
+A forecast is only useful if it beats simple rules of thumb. Two are used here:
+
+- **Climatology:** give each day the historical share of rain days for its calendar month (from the training years).
+- **Persistence:** forecast rain tomorrow if it rained today.
+
+Climatology gives every day a score, so it can be compared with the model on ROC and PR AUC:
+
+```{r baselines}
+monthly_rain_rate <- train |>
+  mutate(month = as.integer(format(date + 1, "%m"))) |>
+  summarise(rate = mean(rain == "yes"), .by = month)
+
+scored <- bind_rows(
+  test_pred |> transmute(model = best_model, rain, score = .pred_yes),
+  test |>
+    mutate(month = as.integer(format(date + 1, "%m"))) |>
+    left_join(monthly_rain_rate, by = "month") |>
+    transmute(model = "Climatology (monthly rain rate)", rain, score = rate)
+)
+
+test_summary <- scored |>
+  group_by(model) |>
+  cv_metrics(truth = rain, score) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  select(model, roc_auc, pr_auc) |>
+  arrange(desc(roc_auc))
+
+knitr::kable(test_summary, digits = 3, col.names = c("Forecast", "Test ROC AUC", "Test PR AUC"))
+
+model_auc <- test_summary$roc_auc[test_summary$model == best_model]
+climatology_auc <- test_summary$roc_auc[test_summary$model != best_model]
+train_auc <- roc_auc(train_pred, rain, .pred_yes)$.estimate
+```
+
+On the test seasons the model reaches a ROC AUC of **`r round(model_auc, 3)`**, well above climatology's `r round(climatology_auc, 3)`. On the training data it scores `r round(train_auc, 3)`. The two are close, so the model is not overfitting.
+
+Persistence only says yes or no, so it has a single operating point rather than a curve. The fair comparison is to set the model's threshold so that it catches the same share of rain days, then compare how often each one's rain forecasts come true:
+
+```{r persistence}
+persistence <- test |>
+  mutate(.pred_class = factor(if_else(rain_today == 1, "yes", "no"), levels = c("yes", "no")))
+persistence_recall <- sensitivity(persistence, rain, .pred_class)$.estimate
+persistence_precision <- precision(persistence, rain, .pred_class)$.estimate
+persistence_fpr <- 1 - specificity(persistence, rain, .pred_class)$.estimate
+
+model_at_same_recall <- pr_curve(test_pred, rain, .pred_yes) |>
+  filter(recall >= persistence_recall) |>
+  slice_max(precision, n = 1, with_ties = FALSE)
+
+tibble(forecast = c("Persistence (rain today)", paste(best_model, "at the same recall")),
+       recall = c(persistence_recall, model_at_same_recall$recall),
+       precision = c(persistence_precision, model_at_same_recall$precision)) |>
+  knitr::kable(digits = 3, col.names = c("Forecast", "Rain days caught (recall)", "Rain forecasts correct (precision)"))
+
+new_storm_days <- filter(test_pred, rain == "yes", rain_today == 0)
+```
+
+At that operating point persistence is slightly ahead: on the day after rain, "more rain tomorrow" is a strong rule, and this model does not improve on it. The model's advantage is on the days persistence can never get right, the first day of a new storm. `r nrow(new_storm_days)` of the `r sum(test$rain == "yes")` test rain days followed a dry day. Persistence misses all of them. The model at its default threshold catches `r percent(mean(new_storm_days$.pred_class == "yes"), accuracy = 1)` of them, at the cost of the false alarms described below.
+
+```{r roc, fig.height = 5.5}
+roc_plot <- scored |>
+  group_by(model) |>
+  roc_curve(rain, score) |>
+  ggplot(aes(x = 1 - specificity, y = sensitivity, colour = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 2, colour = "grey60") +
+  annotate("point", x = persistence_fpr, y = persistence_recall, size = 3, colour = "darkorange") +
+  annotate("text", x = persistence_fpr + 0.03, y = persistence_recall, hjust = 0,
+           label = "Persistence (rain today)", colour = "darkorange") +
+  coord_equal() +
+  scale_colour_manual(values = setNames(c("steelblue", "grey50"), c(best_model, "Climatology (monthly rain rate)"))) +
+  labs(title = "ROC curve on the 2021–2024 test seasons",
+       x = "False positive rate (1 − specificity)", y = "True positive rate (sensitivity)",
+       colour = NULL) +
+  theme(legend.position = "bottom")
+roc_plot
+ggsave(here::here("figures", "roc_curve.png"), roc_plot, width = 6, height = 6.5, dpi = 150, bg = "white")
+```
+
+## Confusion matrix
+
+```{r confusion}
+conf_mat(test_pred, truth = rain, estimate = .pred_class)
+
+class_metrics <- metric_set(accuracy, sensitivity, specificity, precision)
+test_class <- class_metrics(test_pred, truth = rain, estimate = .pred_class)
+knitr::kable(test_class |> select(metric = .metric, value = .estimate), digits = 3)
+get_metric <- \(m) percent(test_class$.estimate[test_class$.metric == m], accuracy = 0.1)
+```
+
+With the default 50% threshold, the model catches `r get_metric("sensitivity")` of rain days (sensitivity), but only `r get_metric("precision")` of its rain forecasts come true (precision). That is the expected trade-off of training on up-sampled data. The model has learned to take rain seriously, so it raises many false alarms on the ~90% of days that stay dry. Where to set the threshold depends on the cost of each mistake: someone deciding whether to cancel an outdoor event needs fewer false alarms than someone deciding whether to bring an umbrella.
+
+## What drives the forecast?
+
+Logistic regression and LDA are both linear models and scored almost identically, so logistic regression's coefficients give a readable picture of what a linear forecast relies on.
+
+```{r coefficients}
+logistic_fit <- if (best_model_key == "Logistic regression") final_fit else fit(workflows[["Logistic regression"]], data = train)
+
+# glm models the probability of the second outcome level ("no"), so the signs
+# are flipped to read as effects on the odds of rain.
+extract_fit_parsnip(logistic_fit) |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  mutate(estimate = -estimate) |>
+  arrange(desc(abs(estimate))) |>
+  mutate(p.value = pvalue(p.value)) |>
+  select(term, estimate, p.value) |>
+  knitr::kable(digits = 3, col.names = c("Predictor", "Effect on log-odds of rain (per SD)", "p-value"))
+```
+
+All predictors are standardised, so each coefficient is the change in the log-odds of rain tomorrow for a one-standard-deviation increase in that predictor. The strongest signals are the season (`doy_cos` peaks in midwinter), temperature, and whether it rained today. Temperature also appears in all three interaction terms, so its individual coefficients should not be read in isolation.
+
+# Same-day vs next-day prediction
+
+How much easier is the same-day shortcut described in [Framing the prediction](#framing-the-prediction)? Fitting logistic regression to both versions of the problem, with the same split and features, shows the difference:
+
+```{r same-day}
+same_day <- split_by_water_year(build_model_data(daily, horizon = 0), test_years = 4)
+same_day_auc <- workflow(make_rain_recipe(same_day$train), logistic_reg()) |>
+  fit(same_day$train) |>
+  augment(same_day$test) |>
+  roc_auc(rain, .pred_yes)
+next_day_auc <- augment(logistic_fit, test) |> roc_auc(rain, .pred_yes)
+
+tibble(task = c("Same day", "Next day (this project)"),
+       test_roc_auc = c(same_day_auc$.estimate, next_day_auc$.estimate)) |>
+  knitr::kable(digits = 3, col.names = c("Task", "Test ROC AUC"))
+```
+
+Classifying rain on the day it happens scores higher because same-day humidity partly *reflects* the rain. The next-day score is lower, but it measures a genuine forecast.
+
+# Conclusion
+
+On the four held-out rainy seasons, `r best_model` predicted next-day rain at Santa Barbara Airport with a test ROC AUC of `r round(model_auc, 3)`, clearly better than the seasonal climatology baseline (`r round(climatology_auc, 3)`). It did **not** beat the simplest rule of all, "rain follows rain", at that rule's own operating point. Its value over that rule is that it also flags the first day of a new storm, which persistence never can, and that its threshold can be tuned to the relative cost of a missed rain day and a false alarm.
+
+The four model families performed similarly. That fits a problem where the main signals (season, temperature, whether it is already raining) are close to linear on the log-odds scale, which is what logistic regression and LDA assume. KNN only caught up with a very large number of neighbours, at which point it behaves much like a linear model itself.
+
+## Limitations
+
+- **One station, few variables.** Real forecasts use pressure, upper-air data and the state of the ocean and atmosphere far upstream. Santa Barbara's rain mostly arrives with Pacific storms that no single-station measurement can see coming.
+- **Small positive class.** The test seasons contain only `r sum(test$rain == "yes")` rain days, more than a third of them in the very wet 2022–23 winter, so the test metrics carry real uncertainty.
+- **Probabilities are not calibrated.** Up-sampling shifts predicted probabilities upward, so "60% chance of rain" from this model should not be read literally.
+
+## Ideas for further work
+
+- Beating persistence probably needs information about approaching storms: changes in temperature and humidity over the previous two or three days, or pressure readings from NOAA's hourly (GHCNh) records.
+- Try a gradient-boosted tree model, and calibrate the probabilities, for example with `probably::cal_estimate_logistic()`.
+
+# References
+
+Bailey, H. P. (2023). *Weather of Southern California* (California Natural History Guides, Vol. 17). University of California Press.
+
+City of Santa Barbara. (2024). *Santa Barbara Water Affordability Study*. [PDF](https://santabarbaraca.gov/sites/default/files/2024-09/AWE_Santa%20Barbara%20Water%20Affordability%20Study_April%202024_FINAL.pdf)
+
+Imon, A. H. M. R., Roy, M. C., & Bhattacharjee, S. K. (2012). Prediction of rainfall using logistic regression. *Pakistan Journal of Statistics and Operation Research, 8*(3), 655–667. https://doi.org/10.18187/pjsor.v8i3.535
+
+Menne, M. J., Durre, I., Vose, R. S., Gleason, B. E., & Houston, T. G. (2012). An overview of the Global Historical Climatology Network-Daily database. *Journal of Atmospheric and Oceanic Technology, 29*(7), 897–910. https://doi.org/10.1175/JTECH-D-11-00103.1
+
+Wu, C. L., & Chau, K. W. (2013). Prediction of rainfall time series using modular soft computing methods. *Engineering Applications of Artificial Intelligence, 26*(3), 997–1007. https://doi.org/10.1016/j.engappai.2012.05.023

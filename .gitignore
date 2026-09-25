@@ -1,0 +1,13 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Intermediate render output (the published report lives in docs/)
+analysis/*.html
+analysis/*_files/
+analysis/*_cache/
+docs/*_files/
+
+# Stray graphics device output from running scripts outside knitr
+Rplots.pdf
